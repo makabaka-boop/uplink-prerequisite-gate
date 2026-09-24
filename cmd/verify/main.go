@@ -85,6 +85,8 @@ type claimOut struct {
 type commandOut struct {
 	ID              int64            `json:"id"`
 	Status          string           `json:"status"`
+	PredecessorID   *int64           `json:"predecessor_id"`
+	BlockedBy       *int64           `json:"blocked_by"`
 	LeaseGeneration int64            `json:"lease_generation"`
 	Settlement      map[string]any   `json:"settlement"`
 	Leases          []map[string]any `json:"leases"`
@@ -329,6 +331,11 @@ func (v *verifier) run(ctx context.Context) error {
 		return err
 	}
 
+	// 前驱链：验证等待、链式解锁、失败阻断传播，以及失败后新建后继立即 blocked。
+	if err := v.checkPredecessorFlow(ctx); err != nil {
+		return err
+	}
+
 	// 场景三：重启 API 进程，重启后终态唯一且一致。
 	if err := v.restartAPIAndRecheck(ctx, cmdPath); err != nil {
 		return err
@@ -392,6 +399,105 @@ func (v *verifier) checkValidation(ctx context.Context) error {
 		return fail("malformed json: expected 400, got %d", resp.StatusCode)
 	}
 	fmt.Println("validation contract checks passed")
+	return nil
+}
+
+func (v *verifier) checkPredecessorFlow(ctx context.Context) error {
+	create := func(predecessor *int64) commandOut {
+		body := map[string]any{"payload": map[string]any{"dependency": true}}
+		if predecessor != nil {
+			body["predecessor_id"] = *predecessor
+		}
+		st, raw := v.doJSON(ctx, http.MethodPost, "/commands", body)
+		if st != http.StatusCreated {
+			fatal(fail("predecessor create: status=%d body=%s", st, raw))
+		}
+		return decode[commandOut](raw)
+	}
+
+	root := create(nil)
+	child := create(&root.ID)
+	grand := create(&child.ID)
+	independent := create(nil)
+
+	if child.PredecessorID == nil || *child.PredecessorID != root.ID ||
+		grand.PredecessorID == nil || *grand.PredecessorID != child.ID {
+		return fail("predecessor IDs not reflected in create responses")
+	}
+
+	if st, _ := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 1000}); st != http.StatusNoContent {
+		return fail("dependent command must wait for predecessor delivery, got %d", st)
+	}
+
+	st, raw := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 2000})
+	if st != http.StatusOK {
+		return fail("claim predecessor root: status=%d body=%s", st, raw)
+	}
+	lease := decode[claimOut](raw)
+	if lease.CommandID != root.ID {
+		return fail("claim selected %d before waiting root %d", lease.CommandID, root.ID)
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", root.ID),
+		map[string]any{"lease_token": lease.LeaseToken, "result": "delivered"})
+	if st != http.StatusOK {
+		return fail("deliver predecessor root: %d %s", st, raw)
+	}
+
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 2000})
+	if st != http.StatusOK {
+		return fail("claim unlocked child: status=%d body=%s", st, raw)
+	}
+	lease = decode[claimOut](raw)
+	if lease.CommandID != child.ID {
+		return fail("claim selected %d, want unlocked child %d", lease.CommandID, child.ID)
+	}
+	if st, _ := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 1000}); st != http.StatusNoContent {
+		return fail("grandchild must remain blocked until child delivery, got %d", st)
+	}
+
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", child.ID),
+		map[string]any{"lease_token": lease.LeaseToken, "result": "failed"})
+	if st != http.StatusOK {
+		return fail("fail child: status=%d body=%s", st, raw)
+	}
+
+	blocked := v.getCommand(ctx, grand.ID)
+	if blocked.Status != "blocked" || blocked.BlockedBy == nil || *blocked.BlockedBy != child.ID {
+		return fail("grandchild failure propagation: %+v", blocked)
+	}
+	if blocked.LeaseGeneration != 0 || len(blocked.Leases) != 0 || blocked.Settlement != nil {
+		return fail("blocked grandchild must not have a lease or settlement: %+v", blocked)
+	}
+	st, raw = v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", grand.ID),
+		map[string]any{"lease_token": "never-issued", "result": "delivered"})
+	if st != http.StatusConflict {
+		return fail("ack blocked grandchild: expected 409, got %d body=%s", st, raw)
+	}
+	if decode[apiError](raw).Error.Code != "command_blocked" {
+		return fail("ack blocked grandchild error code: %s", raw)
+	}
+
+	late := create(&child.ID)
+	if late.Status != "blocked" || late.BlockedBy == nil || *late.BlockedBy != child.ID {
+		return fail("new child of failed predecessor must be created blocked: %+v", late)
+	}
+
+	st, raw = v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 2000})
+	if st != http.StatusOK {
+		return fail("claim unrelated root after blocked chain: %d %s", st, raw)
+	}
+	if decode[claimOut](raw).CommandID != independent.ID {
+		return fail("blocked chain must not block unrelated root: %s", raw)
+	}
+
+	if st, raw := v.doJSON(ctx, http.MethodPost, "/commands",
+		map[string]any{"payload": map[string]any{"x": 1}, "predecessor_id": 987654321}); st != http.StatusUnprocessableEntity {
+		return fail("unknown predecessor: expected 422, got %d body=%s", st, raw)
+	}
+	if decode[apiError](raw).Error.Code != "unknown_predecessor" {
+		return fail("unknown predecessor stable code: %s", raw)
+	}
+	fmt.Println("predecessor flow: chain waiting, unlock, failure propagation and blocked contract passed")
 	return nil
 }
 

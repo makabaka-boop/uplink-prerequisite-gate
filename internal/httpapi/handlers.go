@@ -17,7 +17,8 @@ const maxBodyBytes = 1 << 20 // 1MiB
 // ---- 请求体 ----
 
 type createCommandRequest struct {
-	Payload json.RawMessage `json:"payload"`
+	Payload       json.RawMessage `json:"payload"`
+	PredecessorID json.RawMessage `json:"predecessor_id"`
 }
 
 // claimRequest 用 RawMessage 承接租期，以便把“类型错误（字符串/浮点/布尔）”
@@ -85,6 +86,9 @@ type commandDTO struct {
 	ID                    int64           `json:"id"`
 	Payload               json.RawMessage `json:"payload"`
 	Status                string          `json:"status"`
+	PredecessorID         *int64          `json:"predecessor_id"`
+	BlockedBy             *int64          `json:"blocked_by"`
+	BlockedAt             *time.Time      `json:"blocked_at"`
 	LeaseGeneration       int64           `json:"lease_generation"`
 	CurrentLeaseExpiresAt *time.Time      `json:"current_lease_expires_at"`
 	CreatedAt             time.Time       `json:"created_at"`
@@ -110,6 +114,9 @@ func toCommandDTO(c store.Command) commandDTO {
 		ID:                    c.ID,
 		Payload:               json.RawMessage(c.Payload),
 		Status:                c.Status,
+		PredecessorID:         c.PredecessorID,
+		BlockedBy:             c.BlockedBy,
+		BlockedAt:             c.BlockedAt,
 		LeaseGeneration:       c.LeaseGeneration,
 		CurrentLeaseExpiresAt: c.LeaseExpiresAt,
 		CreatedAt:             c.CreatedAt,
@@ -172,10 +179,21 @@ func (s *Server) handleCreateCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := s.store.CreateCommand(r.Context(), req.Payload)
+	var predecessorID *int64
+	if len(req.PredecessorID) != 0 && string(req.PredecessorID) != "null" {
+		id, ok := parseStrictInt(req.PredecessorID)
+		if !ok || id <= 0 {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_predecessor",
+				`field "predecessor_id" must be a positive integer`)
+			return
+		}
+		predecessorID = new(int64)
+		*predecessorID = int64(id)
+	}
+
+	c, err := s.store.CreateCommand(r.Context(), req.Payload, predecessorID)
 	if err != nil {
-		s.logger.Error("create command failed", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "failed to persist command")
+		s.mapStoreError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, toCommandDTO(*c))
@@ -299,6 +317,9 @@ func (s *Server) mapStoreError(w http.ResponseWriter, r *http.Request, err error
 	switch {
 	case errors.Is(err, store.ErrCommandNotFound):
 		writeError(w, http.StatusNotFound, "unknown_command", "command not found")
+	case errors.Is(err, store.ErrPredecessorNotFound):
+		writeError(w, http.StatusUnprocessableEntity, "unknown_predecessor",
+			"predecessor command does not exist")
 	case errors.Is(err, store.ErrInvalidLeaseToken):
 		writeError(w, http.StatusConflict, "invalid_lease_token", "lease token was never issued for this command")
 	case errors.Is(err, store.ErrLeaseStale):
@@ -307,6 +328,9 @@ func (s *Server) mapStoreError(w http.ResponseWriter, r *http.Request, err error
 	case errors.Is(err, store.ErrAlreadySettled):
 		writeError(w, http.StatusConflict, "already_settled",
 			"command already has a terminal status; duplicate settlement is rejected")
+	case errors.Is(err, store.ErrCommandBlocked):
+		writeError(w, http.StatusConflict, "command_blocked",
+			"command is permanently blocked by a failed predecessor")
 	default:
 		s.logger.Error("request failed", "error", err, "path", r.URL.Path)
 		writeError(w, http.StatusInternalServerError, "internal_error", "internal server error")

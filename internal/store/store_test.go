@@ -34,7 +34,7 @@ func TestConcurrentClaimIsExclusive(t *testing.T) {
 	st := store.New(pool)
 	ctx := context.Background()
 
-	if _, err := st.CreateCommand(ctx, []byte(`{"seq":1}`)); err != nil {
+	if _, err := st.CreateCommand(ctx, []byte(`{"seq":1}`), nil); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -84,7 +84,7 @@ func TestFIFOOrderAndMultipleCommands(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
-		if _, err := st.CreateCommand(ctx, []byte(`{"i":1}`)); err != nil {
+		if _, err := st.CreateCommand(ctx, []byte(`{"i":1}`), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -113,7 +113,7 @@ func TestExpiredLeaseReclaimAndStaleAck(t *testing.T) {
 	st := store.New(pool)
 	ctx := context.Background()
 
-	created, err := st.CreateCommand(ctx, []byte(`{"seq":42}`))
+	created, err := st.CreateCommand(ctx, []byte(`{"seq":42}`), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -194,7 +194,7 @@ func TestAckWithinValidLease(t *testing.T) {
 	st := store.New(pool)
 	ctx := context.Background()
 
-	c, _ := st.CreateCommand(ctx, []byte(`{}`))
+	c, _ := st.CreateCommand(ctx, []byte(`{}`), nil)
 	cl, err := st.Claim(ctx, 2*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -214,7 +214,7 @@ func TestExpiredTokenEvenWithinGenerationRejected(t *testing.T) {
 	st := store.New(pool)
 	ctx := context.Background()
 
-	c, _ := st.CreateCommand(ctx, []byte(`{}`))
+	c, _ := st.CreateCommand(ctx, []byte(`{}`), nil)
 	cl, _ := st.Claim(ctx, 100*time.Millisecond)
 	time.Sleep(160 * time.Millisecond)
 	if err := st.Ack(ctx, c.ID, cl.LeaseToken, store.StatusDelivered); !errors.Is(err, store.ErrLeaseStale) {
@@ -241,7 +241,7 @@ func TestRestartPersistsState(t *testing.T) {
 	st := store.New(pool)
 	ctx := context.Background()
 
-	c, _ := st.CreateCommand(ctx, []byte(`{"persist":true}`))
+	c, _ := st.CreateCommand(ctx, []byte(`{"persist":true}`), nil)
 	cl, _ := st.Claim(ctx, time.Second)
 	if err := st.Ack(ctx, c.ID, cl.LeaseToken, store.StatusDelivered); err != nil {
 		t.Fatal(err)

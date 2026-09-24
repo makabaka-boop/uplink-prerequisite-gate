@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,13 +19,14 @@ const (
 	StatusPending   = "pending"
 	StatusDelivered = "delivered"
 	StatusFailed    = "failed"
+	StatusBlocked   = "blocked"
 )
 
 // 终态结果集合，供 HTTP 层做入参校验。
 var ValidResults = map[string]bool{StatusDelivered: true, StatusFailed: true}
 
 var (
-	// ErrNoAvailableCommand 没有可领取（未结算且租约未生效）的指令。
+	// ErrNoAvailableCommand 没有可领取（前驱链已送达、未结算且租约未生效）的指令。
 	ErrNoAvailableCommand = errors.New("no available command")
 	// ErrCommandNotFound 未知指令编号。
 	ErrCommandNotFound = errors.New("command not found")
@@ -32,8 +34,12 @@ var (
 	ErrInvalidLeaseToken = errors.New("invalid lease token")
 	// ErrLeaseStale 令牌属于过期/被取代的旧代次，或当前代次已到期。
 	ErrLeaseStale = errors.New("lease token is expired or superseded")
-	// ErrAlreadySettled 指令已有终态，禁止重复结算或覆盖。
+	// ErrAlreadySettled 指令已有结算终态，禁止重复结算或覆盖。
 	ErrAlreadySettled = errors.New("command already settled")
+	// ErrCommandBlocked 指令因前驱失败而进入只读 blocked 终态。
+	ErrCommandBlocked = errors.New("command blocked by failed predecessor")
+	// ErrPredecessorNotFound 创建后继时引用的前驱不存在。
+	ErrPredecessorNotFound = errors.New("predecessor command not found")
 )
 
 // Store 基于 pgxpool 的存储实现。
@@ -57,6 +63,10 @@ type Command struct {
 	ID              int64
 	Payload         []byte
 	Status          string
+	PredecessorID   *int64
+	ChainID         int64
+	BlockedBy       *int64
+	BlockedAt       *time.Time
 	LeaseGeneration int64
 	LeaseExpiresAt  *time.Time
 	CreatedAt       time.Time
@@ -104,18 +114,94 @@ func newToken() (string, error) {
 }
 
 // CreateCommand 按调用顺序（由 IDENTITY 列保证）写入一条指令。
-func (s *Store) CreateCommand(ctx context.Context, payload []byte) (*Command, error) {
-	c := &Command{}
-	err := s.pool.QueryRow(ctx, `
-		INSERT INTO commands (payload)
-		VALUES ($1::jsonb)
-		RETURNING id, payload, status, lease_generation, lease_expires_at, created_at, updated_at`,
-		string(payload),
-	).Scan(&c.ID, &c.Payload, &c.Status, &c.LeaseGeneration, &c.LeaseExpiresAt, &c.CreatedAt, &c.UpdatedAt)
+// predecessorID 为空时创建根指令；非空时只能引用已存在的较早指令。
+// 若前驱已经失败或被阻断，新指令在同一事务内直接成为 blocked 终态。
+func (s *Store) CreateCommand(ctx context.Context, payload []byte, predecessorID *int64) (*Command, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
+		return nil, fmt.Errorf("create command begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var chainID int64
+	status := StatusPending
+	var blockedBy *int64
+	var blockedAt *time.Time
+
+	if predecessorID != nil {
+		// 先确定链锁，再读取前驱行；Ack 也按同样顺序加锁，避免创建/结算交错时死锁。
+		err = tx.QueryRow(ctx, `SELECT chain_id FROM commands WHERE id = $1`, *predecessorID).
+			Scan(&chainID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrPredecessorNotFound
+		}
+		if err != nil {
+			return nil, fmt.Errorf("load predecessor chain: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, chainID); err != nil {
+			return nil, fmt.Errorf("lock command chain: %w", err)
+		}
+
+		var parentStatus string
+		var parentBlockedBy *int64
+		err = tx.QueryRow(ctx, `
+			SELECT status, blocked_by
+			FROM commands
+			WHERE id = $1
+			FOR UPDATE`, *predecessorID).
+			Scan(&parentStatus, &parentBlockedBy)
+		if err != nil {
+			return nil, fmt.Errorf("load predecessor: %w", err)
+		}
+
+		switch parentStatus {
+		case StatusPending, StatusDelivered:
+			// pending 前驱尚未送达，新指令保持等待；delivered 前驱已满足条件。
+		case StatusFailed:
+			status = StatusBlocked
+			blockedBy = predecessorID
+			blockedAt = pointerTime(s.now())
+		case StatusBlocked:
+			status = StatusBlocked
+			if parentBlockedBy == nil {
+				return nil, fmt.Errorf("blocked predecessor %d has no blocked_by", *predecessorID)
+			}
+			blockedBy = parentBlockedBy
+			blockedAt = pointerTime(s.now())
+		default:
+			return nil, fmt.Errorf("unknown predecessor status %q", parentStatus)
+		}
+	}
+
+	c := &Command{}
+	err = tx.QueryRow(ctx, `
+		INSERT INTO commands
+		    (payload, predecessor_id, status, blocked_by, blocked_at)
+		VALUES ($1::jsonb, $2, $3, $4, $5)
+		RETURNING id, payload, status, predecessor_id, chain_id, blocked_by, blocked_at,
+		          lease_generation, lease_expires_at, created_at, updated_at`,
+		string(payload), predecessorID, status, blockedBy, blockedAt,
+	).Scan(
+		&c.ID, &c.Payload, &c.Status, &c.PredecessorID, &c.ChainID,
+		&c.BlockedBy, &c.BlockedAt, &c.LeaseGeneration, &c.LeaseExpiresAt,
+		&c.CreatedAt, &c.UpdatedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+			return nil, ErrPredecessorNotFound
+		}
 		return nil, fmt.Errorf("create command: %w", err)
 	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("create command commit: %w", err)
+	}
 	return c, nil
+}
+
+func pointerTime(t time.Time) *time.Time {
+	return &t
 }
 
 // Claim 原子领取最早可用的一条指令：
@@ -131,12 +217,27 @@ func (s *Store) Claim(ctx context.Context, leaseFor time.Duration) (*Claim, erro
 
 	var id int64
 	err = tx.QueryRow(ctx, `
-		SELECT id
-		FROM commands
-		WHERE status = 'pending'
-		  AND (lease_expires_at IS NULL OR lease_expires_at <= now())
-		ORDER BY id ASC
-		FOR UPDATE SKIP LOCKED
+		WITH RECURSIVE delivered_roots(id) AS (
+			SELECT id
+			FROM commands
+			WHERE predecessor_id IS NULL
+			  AND status = 'delivered'
+			UNION
+			SELECT c.id
+			FROM commands c
+			JOIN delivered_roots p ON p.id = c.predecessor_id
+			WHERE c.status = 'delivered'
+		)
+		SELECT c.id
+		FROM commands c
+		WHERE c.status = 'pending'
+		  AND (c.lease_expires_at IS NULL OR c.lease_expires_at <= now())
+		  AND (
+				c.predecessor_id IS NULL
+				OR EXISTS (SELECT 1 FROM delivered_roots r WHERE r.id = c.predecessor_id)
+		  )
+		ORDER BY c.id ASC
+		FOR UPDATE OF c SKIP LOCKED
 		LIMIT 1`).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNoAvailableCommand
@@ -193,6 +294,18 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	}
 	defer tx.Rollback(ctx)
 
+	var chainID int64
+	if err := tx.QueryRow(ctx, `SELECT chain_id FROM commands WHERE id = $1`, id).
+		Scan(&chainID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCommandNotFound
+		}
+		return fmt.Errorf("ack load command chain: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, chainID); err != nil {
+		return fmt.Errorf("ack lock command chain: %w", err)
+	}
+
 	var status string
 	var currentGen int64
 	err = tx.QueryRow(ctx, `
@@ -205,6 +318,17 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("ack load command: %w", err)
+	}
+
+	// 裁决顺序（行锁内，无并发可改写状态）：
+	// 1) 已有终态：blocked 与已结算都拒绝，但错误契约不同；
+	// 2) 令牌非当前代次：旧持有者迟到；
+	// 3) 令牌已过期：租约到期。
+	if status != StatusPending {
+		if status == StatusBlocked {
+			return ErrCommandBlocked
+		}
+		return ErrAlreadySettled
 	}
 
 	// 令牌必须是系统签发过、且属于本指令的（其他指令的令牌视为从未签发）。
@@ -221,13 +345,6 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 		return fmt.Errorf("ack load lease: %w", err)
 	}
 
-	// 裁决顺序（行锁内，无并发可改写状态）：
-	// 1) 已有终态：拒绝重复结算；
-	// 2) 令牌非当前代次：旧持有者迟到；
-	// 3) 令牌已过期：租约到期。
-	if status != StatusPending {
-		return ErrAlreadySettled
-	}
 	if leaseGen != currentGen {
 		return ErrLeaseStale
 	}
@@ -250,6 +367,29 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 		return fmt.Errorf("ack status update: %w", err)
 	}
 
+	if result == StatusFailed {
+		// 前驱确认失败时，沿整条前驱链原子阻断所有尚未领取的直接/间接后继。
+		// 不写 leases/settlements：blocked 是由失败来源导致的只读终态，不是租约结算。
+		if _, err = tx.Exec(ctx, `
+			WITH RECURSIVE descendants(did) AS (
+				SELECT id FROM commands WHERE predecessor_id = $1
+				UNION ALL
+				SELECT c.id
+				FROM commands c
+				JOIN descendants d ON d.did = c.predecessor_id
+			)
+			UPDATE commands
+			SET status = 'blocked',
+			    blocked_by = $1,
+			    blocked_at = now(),
+			    updated_at = now()
+			WHERE id IN (SELECT did FROM descendants)
+			  AND status = 'pending'
+			  AND lease_generation = 0`, id); err != nil {
+			return fmt.Errorf("block dependent commands: %w", err)
+		}
+	}
+
 	return tx.Commit(ctx)
 }
 
@@ -257,9 +397,11 @@ func (s *Store) Ack(ctx context.Context, id int64, token, result string) error {
 func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error) {
 	d := &CommandDetail{}
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, payload, status, lease_generation, lease_expires_at, created_at, updated_at
+		SELECT id, payload, status, predecessor_id, chain_id, blocked_by, blocked_at,
+		       lease_generation, lease_expires_at, created_at, updated_at
 		FROM commands WHERE id = $1`, id).
-		Scan(&d.ID, &d.Payload, &d.Status, &d.LeaseGeneration, &d.LeaseExpiresAt,
+		Scan(&d.ID, &d.Payload, &d.Status, &d.PredecessorID, &d.ChainID,
+			&d.BlockedBy, &d.BlockedAt, &d.LeaseGeneration, &d.LeaseExpiresAt,
 			&d.CreatedAt, &d.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrCommandNotFound
@@ -304,7 +446,8 @@ func (s *Store) GetCommand(ctx context.Context, id int64) (*CommandDetail, error
 // ListCommands 按创建顺序返回指令简要列表。
 func (s *Store) ListCommands(ctx context.Context, limit int) ([]Command, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, payload, status, lease_generation, lease_expires_at, created_at, updated_at
+		SELECT id, payload, status, predecessor_id, chain_id, blocked_by, blocked_at,
+		       lease_generation, lease_expires_at, created_at, updated_at
 		FROM commands
 		ORDER BY id
 		LIMIT $1`, limit)
@@ -315,7 +458,8 @@ func (s *Store) ListCommands(ctx context.Context, limit int) ([]Command, error) 
 	var out []Command
 	for rows.Next() {
 		var c Command
-		if err := rows.Scan(&c.ID, &c.Payload, &c.Status, &c.LeaseGeneration,
+		if err := rows.Scan(&c.ID, &c.Payload, &c.Status, &c.PredecessorID,
+			&c.ChainID, &c.BlockedBy, &c.BlockedAt, &c.LeaseGeneration,
 			&c.LeaseExpiresAt, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("scan command: %w", err)
 		}
