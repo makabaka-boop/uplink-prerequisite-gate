@@ -16,8 +16,11 @@ const maxBodyBytes = 1 << 20 // 1MiB
 
 // ---- 请求体 ----
 
+// createCommandRequest 用 RawMessage 承接前驱编号，以便把“类型错误（字符串/对象）”
+// 与“引用不存在/非更早编号”区分开：前者 422 非法编号，后者 422 前驱不可引用。
 type createCommandRequest struct {
-	Payload json.RawMessage `json:"payload"`
+	Payload       json.RawMessage `json:"payload"`
+	PredecessorID json.RawMessage `json:"predecessor_id"`
 }
 
 // claimRequest 用 RawMessage 承接租期，以便把“类型错误（字符串/浮点/布尔）”
@@ -85,6 +88,8 @@ type commandDTO struct {
 	ID                    int64           `json:"id"`
 	Payload               json.RawMessage `json:"payload"`
 	Status                string          `json:"status"`
+	PredecessorID         *int64          `json:"predecessor_id,omitempty"`
+	BlockedBy             *int64          `json:"blocked_by,omitempty"`
 	LeaseGeneration       int64           `json:"lease_generation"`
 	CurrentLeaseExpiresAt *time.Time      `json:"current_lease_expires_at"`
 	CreatedAt             time.Time       `json:"created_at"`
@@ -110,6 +115,8 @@ func toCommandDTO(c store.Command) commandDTO {
 		ID:                    c.ID,
 		Payload:               json.RawMessage(c.Payload),
 		Status:                c.Status,
+		PredecessorID:         c.PredecessorID,
+		BlockedBy:             c.BlockedBy,
 		LeaseGeneration:       c.LeaseGeneration,
 		CurrentLeaseExpiresAt: c.LeaseExpiresAt,
 		CreatedAt:             c.CreatedAt,
@@ -119,6 +126,8 @@ func toCommandDTO(c store.Command) commandDTO {
 
 func toDetailDTO(d *store.CommandDetail) commandDetailDTO {
 	dto := commandDetailDTO{commandDTO: toCommandDTO(d.Command)}
+	// 空租约历史序列化为 [] 而非 null：blocked/从未领取的指令同样给出稳定的空数组契约。
+	dto.Leases = []leaseViewDTO{}
 	for _, l := range d.Leases {
 		dto.Leases = append(dto.Leases, leaseViewDTO{
 			Generation: l.Generation, ClaimedAt: l.ClaimedAt, ExpiresAt: l.ExpiresAt,
@@ -172,8 +181,27 @@ func (s *Server) handleCreateCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	c, err := s.store.CreateCommand(r.Context(), req.Payload)
+	// predecessor_id 可选：缺省（字段不存在）= 无前驱的旧请求。
+	// 显式 null 视为未提供；其他非正整数类型一律 422。
+	var predecessorID *int64
+	if len(req.PredecessorID) > 0 && string(req.PredecessorID) != "null" {
+		pid, ok := parseStrictInt(req.PredecessorID)
+		if !ok || pid <= 0 {
+			writeError(w, http.StatusUnprocessableEntity, "invalid_predecessor_id",
+				`field "predecessor_id" must be a positive integer when present`)
+			return
+		}
+		pid64 := int64(pid)
+		predecessorID = &pid64
+	}
+
+	c, err := s.store.CreateCommand(r.Context(), req.Payload, predecessorID)
 	if err != nil {
+		if errors.Is(err, store.ErrPredecessorNotFound) {
+			writeError(w, http.StatusUnprocessableEntity, "predecessor_not_found",
+				"predecessor_id must reference an existing earlier command")
+			return
+		}
 		s.logger.Error("create command failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "failed to persist command")
 		return

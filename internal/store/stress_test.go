@@ -19,7 +19,7 @@ func TestHighConcurrencyMultipleCommands(t *testing.T) {
 
 	const cmds = 10
 	for i := 0; i < cmds; i++ {
-		if _, err := st.CreateCommand(ctx, []byte(`{}`)); err != nil {
+		if _, err := st.CreateCommand(ctx, []byte(`{}`), nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -106,7 +106,7 @@ func TestConcurrentMigrateIsSafe(t *testing.T) {
 	}
 	defer p.Close()
 	st := store.New(p)
-	c, err := st.CreateCommand(context.Background(), []byte(`{}`))
+	c, err := st.CreateCommand(context.Background(), []byte(`{}`), nil)
 	if err != nil {
 		t.Fatalf("create after concurrent migrate: %v", err)
 	}

@@ -85,9 +85,24 @@ type claimOut struct {
 type commandOut struct {
 	ID              int64            `json:"id"`
 	Status          string           `json:"status"`
+	PredecessorID   *int64           `json:"predecessor_id"`
+	BlockedBy       *int64           `json:"blocked_by"`
 	LeaseGeneration int64            `json:"lease_generation"`
 	Settlement      map[string]any   `json:"settlement"`
 	Leases          []map[string]any `json:"leases"`
+}
+
+// createCommand 创建一条指令（predecessor 传 nil 表示无前驱），断言 201 并返回。
+func (v *verifier) createCommand(ctx context.Context, payload map[string]any, predecessor *int64) commandOut {
+	body := map[string]any{"payload": payload}
+	if predecessor != nil {
+		body["predecessor_id"] = *predecessor
+	}
+	status, raw := v.doJSON(ctx, http.MethodPost, "/commands", body)
+	if status != http.StatusCreated {
+		fatal(fail("create command: status=%d body=%s", status, raw))
+	}
+	return decode[commandOut](raw)
 }
 
 // doJSON 发送 JSON 请求并返回状态码与原始体。
@@ -151,6 +166,11 @@ func (v *verifier) waitForAPI(ctx context.Context) error {
 func (v *verifier) run(ctx context.Context) error {
 	// 场景零：输入校验契约。
 	if err := v.checkValidation(ctx); err != nil {
+		return err
+	}
+
+	// 前驱链：链式解锁、失败传播、阻断来源与旧指令兼容。
+	if err := v.checkPredecessorChains(ctx); err != nil {
 		return err
 	}
 
@@ -333,6 +353,135 @@ func (v *verifier) run(ctx context.Context) error {
 	if err := v.restartAPIAndRecheck(ctx, cmdPath); err != nil {
 		return err
 	}
+	return nil
+}
+
+// checkPredecessorChains 验证前驱链完整契约：
+//   - 创建可带可选 predecessor_id，只能引用已存在的较早编号；非法类型 422、
+//     未知编号 422 predecessor_not_found；
+//   - 前驱未全部送达的后继不可领取（不预发租约），根送达后逐节解锁；
+//   - 链上某节点 failed，其尚未领取的后继原子转只读 blocked、记录同一阻断来源，
+//     不写租约或结算，且 blocked 不可领取/不可确认；
+//   - 无 predecessor_id 的旧指令行为完全不变。
+func (v *verifier) checkPredecessorChains(ctx context.Context) error {
+	// 非法 predecessor_id 类型/取值 -> 422 invalid_predecessor_id。
+	for _, body := range []string{
+		`{"payload":{},"predecessor_id":"1"}`,
+		`{"payload":{},"predecessor_id":true}`,
+		`{"payload":{},"predecessor_id":0}`,
+		`{"payload":{},"predecessor_id":-7}`,
+	} {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+"/commands",
+			bytes.NewReader([]byte(body)))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := v.client.Do(req)
+		if err != nil {
+			return fmt.Errorf("bad predecessor request: %w", err)
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnprocessableEntity {
+			return fail("invalid predecessor %s: status=%d body=%s", body, resp.StatusCode, raw)
+		}
+		if decode[apiError](raw).Error.Code != "invalid_predecessor_id" {
+			return fail("invalid predecessor %s: wrong code %s", body, raw)
+		}
+	}
+	// 未知（更晚/不存在）编号 -> 422 predecessor_not_found。
+	st, raw := v.doJSON(ctx, http.MethodPost, "/commands",
+		map[string]any{"payload": map[string]any{}, "predecessor_id": 987654321})
+	if st != http.StatusUnprocessableEntity || decode[apiError](raw).Error.Code != "predecessor_not_found" {
+		return fail("unknown predecessor: status=%d body=%s", st, raw)
+	}
+
+	// 链 r0 <- r1 <- r2 <- r3。无前驱旧指令的兼容性在链裁决结束后单独验证，
+	// 以免它作为独立根提前进入可领取集合干扰链式解锁断言。
+	r0 := v.createCommand(ctx, map[string]any{"node": 0}, nil)
+	r1 := v.createCommand(ctx, map[string]any{"node": 1}, &r0.ID)
+	r2 := v.createCommand(ctx, map[string]any{"node": 2}, &r1.ID)
+	r3 := v.createCommand(ctx, map[string]any{"node": 3}, &r2.ID)
+	for _, c := range []commandOut{r1, r2, r3} {
+		if c.Status != "pending" {
+			return fail("chain node %d created as %s, want pending", c.ID, c.Status)
+		}
+	}
+	fmt.Printf("predecessor chain created: r0=%d r1=%d r2=%d r3=%d\n", r0.ID, r1.ID, r2.ID, r3.ID)
+
+	// 最小可领取是 r0（编号最小且无前驱）；持有期间其余全部等待。
+	claim := func() (int, claimOut) {
+		s, b := v.doJSON(ctx, http.MethodPost, "/claims", map[string]any{"lease_duration_ms": 2000})
+		var cl claimOut
+		if s == http.StatusOK {
+			cl = decode[claimOut](b)
+		}
+		return s, cl
+	}
+	s, cl := claim()
+	if s != http.StatusOK || cl.CommandID != r0.ID {
+		return fail("first chain claim: status=%d claim=%+v want r0=%d", s, cl, r0.ID)
+	}
+	if s, _ := claim(); s != http.StatusNoContent {
+		return fail("while r0 leased, successors must not be pre-leased: status=%d", s)
+	}
+	if s, b := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", r0.ID),
+		map[string]any{"lease_token": cl.LeaseToken, "result": "delivered"}); s != http.StatusOK {
+		return fail("deliver r0: status=%d body=%s", s, b)
+	}
+	// r0 delivered -> r1 解锁为最小可领取。
+	if s, cl := claim(); s != http.StatusOK || cl.CommandID != r1.ID {
+		return fail("after r0 delivered, want r1=%d claimable: status=%d %+v", r1.ID, s, cl)
+	} else {
+		// r1 失败 -> r1 failed；r2、r3（均未领取）原子 blocked，阻断来源=r1。
+		if s, b := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", r1.ID),
+			map[string]any{"lease_token": cl.LeaseToken, "result": "failed"}); s != http.StatusOK {
+			return fail("fail r1: status=%d body=%s", s, b)
+		}
+	}
+	for _, id := range []int64{r2.ID, r3.ID} {
+		got := v.getCommand(ctx, id)
+		if got.Status != "blocked" || got.BlockedBy == nil || *got.BlockedBy != r1.ID {
+			return fail("node %d: status=%s blocked_by=%v want blocked by r1=%d",
+				id, got.Status, got.BlockedBy, r1.ID)
+		}
+		if len(got.Leases) != 0 || got.Settlement != nil {
+			return fail("blocked node %d must have no leases/settlement: leases=%d settlement=%v",
+				id, len(got.Leases), got.Settlement)
+		}
+	}
+	// blocked 链不可领取；对 blocked 后继的确认被 409 already_settled 拒绝。
+	if s, _ := claim(); s != http.StatusNoContent {
+		return fail("blocked successors must not be claimable: status=%d", s)
+	}
+	if s, b := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", r2.ID),
+		map[string]any{"lease_token": "00", "result": "delivered"}); s != http.StatusConflict ||
+		decode[apiError](b).Error.Code != "already_settled" {
+		return fail("ack blocked r2: status=%d body=%s want 409 already_settled", s, b)
+	}
+	// 失败根 r1 之后再挂后继：出生即 blocked，继承阻断来源 r1。
+	born := v.createCommand(ctx, map[string]any{"late": true}, &r1.ID)
+	if born.Status != "blocked" || born.BlockedBy == nil || *born.BlockedBy != r1.ID {
+		return fail("late successor of failed root must be born blocked: %+v", born)
+	}
+
+	// 旧指令不受影响：无 predecessor_id 的指令在 blocked 链旁仍正常创建与领取。
+	// 它此刻是全库唯一可领取指令（r0 delivered、r1 failed、r2/r3 blocked）。
+	legacy := v.createCommand(ctx, map[string]any{"legacy": true}, nil)
+	if legacy.PredecessorID != nil || legacy.BlockedBy != nil {
+		return fail("legacy command must carry no predecessor/blocked_by: %+v", legacy)
+	}
+	s, cl = claim()
+	if s != http.StatusOK || cl.CommandID != legacy.ID {
+		return fail("legacy command must be the claimable one: status=%d claim=%+v want %d",
+			s, cl, legacy.ID)
+	}
+	if s, b := v.doJSON(ctx, http.MethodPost, fmt.Sprintf("/commands/%d/ack", legacy.ID),
+		map[string]any{"lease_token": cl.LeaseToken, "result": "delivered"}); s != http.StatusOK {
+		return fail("deliver legacy: status=%d body=%s", s, b)
+	}
+	if s, _ := claim(); s != http.StatusNoContent {
+		return fail("after legacy delivered nothing should be claimable: status=%d", s)
+	}
+	fmt.Println("predecessor chain checks passed (sequential unlock + failure propagation + legacy)")
 	return nil
 }
 
